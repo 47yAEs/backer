@@ -1,0 +1,12 @@
+# 前缀部分(不以.开头) - 将与硬编码后缀(.zip,.bak等)组合
+www
+
+# 完整路径部分(以.开头) - 不会与后缀组合
+.git
+.svn
+.config
+.env
+.htaccess.bak
+.DS_Store
+.idea
+.vscode

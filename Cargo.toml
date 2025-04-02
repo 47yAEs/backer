@@ -1,0 +1,32 @@
+[package]
+name = "backer"
+version = "0.1.0"
+edition = "2021"
+authors = ["Backer Team"]
+description = "一个高性能的网站备份文件扫描工具"
+
+[dependencies]
+tokio = { version = "1.28", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+futures = "0.3"
+clap = { version = "4.3", features = ["derive"] }
+url = "2.4.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.2"
+log = "0.4"
+env_logger = "0.10"
+indicatif = "0.17"
+thiserror = "1.0"
+regex = "1.8"
+rayon = "1.7"
+bytes = "1.4"
+rand = "0.8"
+async-trait = "0.1"
+chrono = "0.4"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1 
