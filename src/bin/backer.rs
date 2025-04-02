@@ -165,25 +165,20 @@ async fn main() -> Result<()> {
     println!("  随机IP: {}", !cli.no_random_ip);
     println!("  验证内容: {}", cli.verify);
     
-    // 设置全局超时保护，防止程序永久卡住
-    let total_timeout = std::cmp::max(cli.timeout * 5, 60); // 至少60秒，最多是超时的5倍
-    
-    // 用超时包装扫描过程
-    let scan_result = tokio::time::timeout(
-        std::time::Duration::from_secs(total_timeout),
-        scanner.scan(targets)
-    ).await;
+    // 用更灵活的方式处理扫描过程
+    let scan_result = scanner.scan(targets).await;
     
     let results = match scan_result {
-        Ok(result) => match result {
-            Ok(results) => results,
-            Err(e) => {
-                eprintln!("扫描过程中发生错误: {}", e);
-                return Ok(());
+        Ok(results) => results,
+        Err(e) => {
+            eprintln!("扫描过程中发生错误: {}", e);
+            // 即使出错也尝试保存已有结果
+            if let Some(partial_results) = scanner.get_partial_results() {
+                if !partial_results.is_empty() && cli.output.is_some() {
+                    println!("保存部分扫描结果 ({} 个发现)...", partial_results.len());
+                    let _ = save_results(&partial_results, cli.format.into(), cli.output.as_ref());
+                }
             }
-        },
-        Err(_) => {
-            eprintln!("扫描总体超时，程序将退出");
             return Ok(());
         }
     };

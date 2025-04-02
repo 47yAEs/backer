@@ -20,6 +20,8 @@ pub struct Scanner {
     pattern_success_rates: Arc<Mutex<HashMap<String, (usize, usize)>>>, // (成功数, 总尝试数)
     // 当前动态线程数
     current_threads: Arc<Mutex<usize>>,
+    // 部分结果存储 - 即使在超时的情况下也可以保存已发现的结果
+    partial_results: Arc<Mutex<Vec<ScanResult>>>,
 }
 
 #[allow(dead_code)]
@@ -40,6 +42,7 @@ impl Scanner {
             client,
             pattern_success_rates: Arc::new(Mutex::new(HashMap::new())),
             current_threads: Arc::new(Mutex::new(threads)),
+            partial_results: Arc::new(Mutex::new(Vec::new())),
         })
     }
     
@@ -56,6 +59,12 @@ impl Scanner {
     /// 设置debug模式
     pub fn set_debug(&mut self, enable: bool) {
         self.client.set_debug(enable);
+    }
+    
+    /// 获取部分扫描结果
+    pub fn get_partial_results(&self) -> Option<Vec<ScanResult>> {
+        let guard = self.partial_results.lock().ok()?;
+        Some(guard.clone())
     }
     
     /// 扫描目标站点
@@ -100,25 +109,58 @@ impl Scanner {
         // 对每个域名进行处理
         for (domain, domain_targets) in domain_targets {
             progress_bar.set_message(format!("域名: {}", domain));
+            debug!("开始扫描域名: {}", domain);
             
-            for target in domain_targets {
-                // 为每个目标生成备份文件URL
-                let urls = generate_backup_urls(&target, &patterns);
-                
-                // 对URL模式按历史成功率排序
-                let sorted_urls = self.sort_urls_by_success_rate(urls);
-                
-                // 扫描URL
-                let results = self.scan_urls(&self.client, sorted_urls, self.config.verify_content, progress_bar.clone()).await;
-                
-                // 合并结果
-                all_results.extend(results);
+            // 为每个域名设置单独的超时控制，避免一个域名拖慢整个扫描
+            let domain_timeout = std::cmp::max(self.config.timeout * 3, 30); // 单个域名的超时时间
+            let domain_scan_future = async {
+                for target in domain_targets {
+                    // 为每个目标生成备份文件URL
+                    let urls = generate_backup_urls(&target, &patterns);
+                    debug!("为目标 {} 生成了 {} 个URL", target, urls.len());
+                    
+                    // 对URL模式按历史成功率排序
+                    let sorted_urls = self.sort_urls_by_success_rate(urls);
+                    
+                    // 扫描URL
+                    let results = self.scan_urls(&self.client, sorted_urls, self.config.verify_content, progress_bar.clone()).await;
+                    
+                    // 合并结果
+                    all_results.extend(results);
+                }
+                Ok::<_, crate::BackerError>(())
+            };
+            
+            // 使用超时包装域名扫描过程
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(domain_timeout),
+                domain_scan_future
+            ).await {
+                Ok(result) => {
+                    if let Err(e) = result {
+                        debug!("域名 {} 扫描出错: {:?}", domain, e);
+                    }
+                },
+                Err(_) => {
+                    // 域名扫描超时，记录日志但继续下一个
+                    debug!("域名 {} 扫描超时，继续执行下一个域名", domain);
+                    println!("警告: 域名 {} 扫描超时，跳过并继续下一个", domain);
+                }
             }
             
             progress_bar.inc(1);
         }
         
         progress_bar.finish();
+        
+        // 如果在部分结果中有更多，也合并到最终结果
+        if let Ok(partial) = self.partial_results.lock() {
+            for result in partial.iter() {
+                if !all_results.iter().any(|r| r.url == result.url) {
+                    all_results.push(result.clone());
+                }
+            }
+        }
         
         Ok(all_results)
     }
@@ -236,7 +278,7 @@ impl Scanner {
         let start_time = Instant::now();
         
         // 使用固定线程数，避免动态调整造成的复杂性
-        let threads = std::cmp::min(self.config.threads, 5); 
+        let threads = std::cmp::min(self.config.threads, 10); // 放宽限制到10个线程 
         let semaphore = Arc::new(Semaphore::new(threads));
         
         // 统计根目录URL数量（假设PatternGenerator正确将根目录URL放在前面）
@@ -273,7 +315,7 @@ impl Scanner {
             progress_bar.set_length(backup_urls.len() as u64);
             progress_bar.set_message(format!("扫描备份目录 (线程数: {})", threads));
             
-            // 2. 再扫描备份目录
+            // 2. 再扫描备份目录 - 每个URL都设置短超时，防止卡住
             let _backup_results = self.scan_url_batch(client, backup_urls, verify_content, progress_bar.clone(), results.clone(), semaphore.clone()).await;
         }
         
@@ -306,6 +348,9 @@ impl Scanner {
         let mut tasks = Vec::with_capacity(urls.len());
         let urls_count = urls.len();
         
+        // 每URL设置短的超时，防止慢速URL拖慢整个扫描
+        let url_timeout = std::cmp::min(self.config.timeout, 5); // 单个URL最多5秒
+        
         for url in urls {
             let semaphore = semaphore.clone();
             let client = client.clone();
@@ -317,7 +362,7 @@ impl Scanner {
                 let _permit = semaphore.acquire().await.expect("信号量错误");
                 
                 // 添加整体超时保护 - 使用较小的超时值，确保不会单个请求卡住太久
-                let timeout_duration = Duration::from_secs(std::cmp::min(self_ref.config.timeout, 10)); // 最多10秒
+                let timeout_duration = Duration::from_secs(url_timeout);
                 let url_check = tokio::time::timeout(
                     timeout_duration,
                     client.check_url(&url, verify_content)
@@ -361,8 +406,14 @@ impl Scanner {
                                 }
                             }
                             
+                            // 添加到结果集
                             let mut results_guard = results.lock().unwrap();
-                            results_guard.push(result);
+                            results_guard.push(result.clone());
+                            
+                            // 同时添加到部分结果中，以便在超时时能够获取
+                            if let Ok(mut partial_results) = self_ref.partial_results.lock() {
+                                partial_results.push(result);
+                            }
                         },
                         Ok(None) => {
                             // 更新模式失败率
@@ -387,12 +438,14 @@ impl Scanner {
             tasks.push(task);
         }
         
-        // 等待任务批次完成，设置更合理的超时
-        // 为每个URL分配3秒，但不超过2分钟
-        let per_url_time_ms = 3000; // 3秒/URL
-        let max_timeout_ms = 120_000; // 2分钟
-        let batch_timeout_ms = std::cmp::min(urls_count as u64 * per_url_time_ms, max_timeout_ms);
-        let batch_timeout = Duration::from_millis(batch_timeout_ms);
+        // 设置批次超时 - 避免批量请求卡住
+        // 最多给每个URL分配3秒，总时间不超过30秒
+        let batch_timeout_secs = std::cmp::min(
+            urls_count * 3, // 每个URL最多3秒
+            30              // 批次最多30秒
+        );
+        
+        let batch_timeout = Duration::from_secs(batch_timeout_secs as u64);
         
         match tokio::time::timeout(batch_timeout, future::join_all(tasks)).await {
             Ok(_) => {
@@ -417,6 +470,7 @@ impl Clone for Scanner {
             client: self.client.clone(),
             pattern_success_rates: self.pattern_success_rates.clone(),
             current_threads: self.current_threads.clone(),
+            partial_results: self.partial_results.clone(),
         }
     }
 } 
